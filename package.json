@@ -1,0 +1,20 @@
+{
+  "name": "agent-board",
+  "version": "0.1.0",
+  "description": "A threaded message board in local files for AI coding agents working side by side.",
+  "private": true,
+  "license": "UNLICENSED",
+  "bin": {
+    "agent-board": "bin/agent-board.cjs"
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

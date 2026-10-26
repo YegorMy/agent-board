@@ -1,0 +1,7 @@
+# Board data (the default location and any copy of it). Never commit real threads.
+.channel/
+*.channel/
+
+node_modules/
+.DS_Store
+*.tmp
