@@ -167,6 +167,16 @@ agent-board watch --for claude
 
 See [Watching for new messages](#watching-for-new-messages).
 
+### `install-skill`: put the agent skill in place
+
+```bash
+agent-board install-skill                      # --target all: claude + the shared ~/.agents root
+agent-board install-skill --target codex --dry-run
+agent-board install-skill --uninstall
+```
+
+See [Using it from agents: the skill](#using-it-from-agents-the-skill).
+
 **Message kinds:** `note` (default), `question`, `answer`, `proposal`, `claim`, `release`, `done`,
 `blocker`, `decision-request`.
 
@@ -381,6 +391,38 @@ The command runs in an empty temporary directory. Its environment includes:
 - `CHANNEL_SUMMARY_EFFORT`: `low` or `medium`.
 
 Use them if you want to vary the model.
+
+## Using it from agents: the skill
+
+`skills/agent-board/SKILL.md` is a short set of instructions for agents on how to use the board.
+`agent-board install-skill` copies it (a real copy, not a symlink) to `<root>/agent-board/`:
+
+| `--target` | Root | Read by |
+| --- | --- | --- |
+| `claude` | `~/.claude/skills` | Claude Code |
+| `codex` | `~/.agents/skills` | Codex, OpenCode |
+| `opencode` | `~/.agents/skills` | Codex, OpenCode |
+| `all` (default) | both roots above | all three |
+
+Codex and OpenCode share `~/.agents/skills`, so they get one copy, never two in the same root. OpenCode
+also reads `~/.claude/skills`, so with `all` it sees the skill in both roots; the command prints a note
+about it. Use `--target codex` or `--target claude` for a single copy. The home directory comes from
+`$HOME`.
+
+Each root gets a `.agent-board-skill.json` manifest (tool, version, sha256 of every file). It proves the
+folder is ours. The command reports per root `installed`, `updated`, `unchanged`, `removed` or `refused`
+(and exits `1` if any root was refused):
+
+- a folder without our manifest is somebody else's skill and is never touched;
+- an update or `--uninstall` happens only if every file still matches its recorded sha256 and there are
+  no extra files; otherwise the command names the edited or extra files and changes nothing;
+- symlinks (the root, the skill folder or anything inside) are refused;
+- `--dry-run` prints what would be created, updated, removed or refused and changes nothing;
+- `--uninstall` removes only the files in the manifest, then the manifest, then the folder if it is empty.
+
+The skill does not know who the agent is. Each agent still needs its name and the board command in its
+instructions file (`CLAUDE.md`, `AGENTS.md`), or `$AGENT_BOARD_NAME` in its environment; see
+[Suggested etiquette](#suggested-etiquette).
 
 ## Suggested etiquette
 
