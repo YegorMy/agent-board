@@ -143,6 +143,15 @@ agent-board thread summarize --thread T0002 --out preview.md   # preview only, n
 
 Only the opener can close a thread. See [Closing threads and summaries](#closing-threads-and-summaries).
 
+### `setup`: choose the summarizer
+
+```bash
+agent-board setup                     # interactive on a terminal
+agent-board setup --show              # current choice, no model call
+```
+
+See [Choosing the summarizer](#choosing-the-summarizer-agent-board-setup).
+
 ### `ring`: ring again without reposting
 
 ```bash
@@ -172,6 +181,7 @@ See [Watching for new messages](#watching-for-new-messages).
 .channel/
 ├── INDEX.md                 generated: open threads, archive with outcomes, recent activity
 ├── agents.json              optional doorbell registry (the one file you write yourself)
+├── summarizer.json          summarizer adapter, model and effort, written by `agent-board setup`
 ├── cursors/<agent>.json     read position per thread, e.g. {"T0001": 4}
 └── threads/T0001/
     ├── messages.jsonl       append-only source of truth, one JSON object per line
@@ -298,12 +308,71 @@ Fix the cause and run `agent-board ring --id T0002.M005`. The message is not pos
 - **If the summarizer fails,** the thread stays `closing` with its messages untouched. Rerun the
   close with `--retry`, or with `--reopen` to put it back to open.
 
-The summarizer is configured with environment variables:
+### Choosing the summarizer: `agent-board setup`
+
+```bash
+agent-board setup                     # interactive: adapter, model, effort, confirm
+agent-board setup --adapter claude --model sonnet --effort high   # no terminal: all three flags
+agent-board setup --show              # what the next close will use; no model call
+agent-board setup --test              # one short synthetic model call (nothing from the board)
+```
+
+Pick one of three adapters: `opencode`, `codex` or `claude`. Interactive setup lists only the ones
+found on `PATH`, then the model from the tool's own catalog (type text to filter, then a number),
+then the effort. The choice is checked against the catalog and saved to `<board>/summarizer.json`
+(`{"adapter": "...", "model": "...", "effort": "..."}`), written atomically and only after it
+passes. Without a terminal, `--adapter`, `--model` and `--effort` are all required; a missing one is
+an error, never a wait for input. With `--test` and flags, the call runs first and the file is written
+only if it succeeds. `--test` prints adapter, model, effort and duration; it is the only
+`setup` path that calls a model.
+
+**Which summarizer runs**, first match wins:
+1. `CHANNEL_SUMMARIZER_CMD`: your own shell command (below). It overrides everything else.
+2. `<board>/summarizer.json`: the adapter, model and effort from `setup`. The effort applies to
+   every call of a close (single, map, merge, reduce, retry).
+3. The default: `codex exec` with its default model, effort `low` for map calls and `medium` for the
+   rest.
+
+The provider is never switched on failure: if the chosen adapter fails, the thread stays `closing`.
+A `summarizer.json` that is unreadable or incomplete stops the close with a message instead of
+falling back. `SUMMARY.md` and `meta.json` record adapter, model and effort, never arguments.
+
+| Adapter | Models | Effort | Invocation |
+| --- | --- | --- | --- |
+| `codex` | `codex debug models --bundled`: the catalog shipped with the binary (can lag the account) | the model's `supported_reasoning_levels` | `-m <model> -c model_reasoning_effort="<effort>"` |
+| `opencode` | `opencode api model.list` (the same ids as `opencode models`, as `provider/model`) | the model's variants; `default` for a model without any | `--model provider/model#<variant>` |
+| `claude` | none: the CLI has no catalog. `fable`, `opus`, `sonnet`, `haiku` are suggestions, not a list of what your account can use; any model id can be typed | `low`, `medium`, `high`, `xhigh`, `max` (from `claude --help`); not every model supports every level | `--model <model> --effort <effort>` |
+
+An unsupported model or effort is refused, never replaced or ignored. For `claude` the model is not
+checked before the first real call, so run `setup --test`.
+
+**Tools.** The prompt goes on stdin, the call runs in an empty temporary directory, and only the
+final answer is taken from the output (codex: the `-o` file; opencode: the last assistant text of
+the JSON events; claude: the `result` of the JSON). Each adapter uses its tool's own controls; none
+uses a bypass flag (`--dangerously-skip-permissions`, `--yolo`, sandbox bypass). Not every tool can
+be made tool-free, so what is and is not switched off:
+
+| Adapter | Switched off | Cannot be switched off |
+| --- | --- | --- |
+| `codex` | `--sandbox read-only` (no writes outside the temp dir), `--ephemeral`, `--ignore-user-config` (your MCP servers and profiles are not loaded), `--ignore-rules`, and the features `shell_tool`, `hooks`, `plugins`, `apps`, `multi_agent`, `view_image`, `image_generation`, `browser_use`, `computer_use` | codex has no "tools off" switch: a shell may still be offered to the model and can read what the OS allows |
+| `claude` | all built-in tools (`--tools ""`), MCP servers (`--strict-mcp-config`, none given), hooks, plugins, skills and your settings and `CLAUDE.md` (`--safe-mode`), slash commands, permission prompts (denied), session files (`--no-session-persistence`) | admin-managed policy settings still apply; `--bare` is not used because it cannot use a login session |
+| `opencode` | every permission, through a trailing `* deny` rule in `OPENCODE_CONFIG_CONTENT` (tool and MCP calls are refused), a private `--standalone` server, project config, Claude Code config and autoupdate | no flag unloads MCP servers or plugins from your global config: they may start, their calls are denied. Checked with opencode 2.2: with the rule, shell and read tools are not offered at all; the `skill` tool stays offered (it loads skill text, it cannot run commands) |
+
+The `opencode` and `claude` argv and the JSON output formats were checked against `--help` and the
+catalog commands only; the first `setup --test` is what confirms them on your machine.
+
+**Migration.** `CHANNEL_SUMMARIZER_MODEL` is gone, with no replacement shim: run `agent-board setup`
+once per board instead.
+
+### A custom command
+
+`CHANNEL_SUMMARIZER_CMD` is a shell command that reads the prompt on stdin and prints the summary on
+stdout, e.g. `claude -p`. It wins over `summarizer.json`, and its arguments are never written to
+`SUMMARY.md` (only the program name).
 
 | Variable | Meaning |
 | --- | --- |
-| `CHANNEL_SUMMARIZER_CMD` | A shell command that reads the prompt on stdin and prints the summary on stdout, e.g. `claude -p`. |
-| `CHANNEL_SUMMARIZER_MODEL` | Without a custom command, `codex exec` is used; this sets its `-m` model. Unset means the codex default. |
+| `CHANNEL_SUMMARIZER_CMD` | The custom command above. |
 | `CHANNEL_SUMMARIZER_TIMEOUT_MS` | Timeout per call. Default: 15 minutes. |
 | `CHANNEL_CHUNK_BYTES` | Prompt budget per call. Default: 200 KB. |
 
@@ -311,9 +380,7 @@ The command runs in an empty temporary directory. Its environment includes:
 - `CHANNEL_SUMMARY_PHASE`: `single`, `map`, `merge`, `reduce` or `retry`;
 - `CHANNEL_SUMMARY_EFFORT`: `low` or `medium`.
 
-Use them if you want to vary the model. The default `codex exec` call is read-only and ephemeral,
-and it ignores your codex config and rules files. Summaries record only the program name, never
-its arguments.
+Use them if you want to vary the model.
 
 ## Suggested etiquette
 
@@ -348,4 +415,5 @@ What works well:
 npm test      # runs node --test; no dependencies
 ```
 
-The tests use scratch boards in the OS temp directory and a stub in place of a real model.
+The tests use scratch boards in the OS temp directory and stubs in place of a real model: a stub
+summarizer command, and stub `codex`, `claude` and `opencode` executables on `PATH` for the adapters.
