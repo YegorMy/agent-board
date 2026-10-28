@@ -13,8 +13,9 @@ const { test } = require('node:test');
 const CLI = path.resolve(__dirname, '..', 'bin', 'agent-board.cjs');
 const STUB = path.resolve(__dirname, 'stub-summarizer.cjs');
 
-function board() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-board-test-'));
+function board(sub) {
+  let dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-board-test-'));
+  if (sub) fs.mkdirSync(dir = path.join(dir, sub));
   return { dir, log: path.join(dir, 'stub.log') };
 }
 
@@ -377,8 +378,8 @@ test('ring uses the posted id; a failed doorbell is retried without reposting', 
 
 // A board with a fake tmux. pane() describes a pane tagged on this board, other() one tagged on another board;
 // env(panes) resets the fake server to those panes and returns the environment for run().
-function tmuxBoard(agents) {
-  const b = board();
+function tmuxBoard(agents, sub) {
+  const b = board(sub);
   const tmuxLog = path.join(b.dir, 'tmux.log');
   const stateFile = path.join(b.dir, 'tmux-state.json');
   const option = boardOption(b.dir);
@@ -507,6 +508,38 @@ test('a command doorbell works without tmux, and --to all reports no tmux failur
   assert.equal(all.stderr, '');
   assert.match(all.stdout, /rang bob for T0001.M003/);
   assert.equal(fs.readFileSync(ringLog, 'utf8').split('\n').filter(Boolean).length, 2);
+});
+
+test('--to all says so when tmux discovery fails and nothing else rang', () => {
+  const t = tmuxBoard();
+  const empty = path.join(t.b.dir, 'empty');
+  const probe = run(t.b, ['thread', 'open', '--from', 'ann', '--title', 'probe', '--body', 'x', '--ring'], { env: { PATH: empty } });
+  assert.equal(probe.status, 3);
+  assert.match(probe.stderr, /ring failed for all: tmux is not installed or not on PATH; retry with: ring --id T0002.M001\n$/);
+  fs.writeFileSync(path.join(t.b.dir, 'agents.json'), '{}');
+  assert.equal(run(t.b, ringAll, { env: { PATH: empty } }).status, 3);
+  const fixed = run(t.b, ['ring', '--id', 'T0002.M001'], { env: t.env([t.pane('%3', 'bob')]) });
+  assert.match(ok(fixed), /rang bob for T0002.M001/);
+  // A good listing with nobody to ring is not an error, and a per-agent tmux failure is not doubled.
+  assert.deepEqual([run(t.b, ringAll, { env: t.env([t.pane('%4', 'ann')]) }).status, run(t.b, ringAll, { env: t.env([t.pane('%4', 'ann')]) }).stderr], [0, '']);
+  fs.writeFileSync(path.join(t.b.dir, 'agents.json'), JSON.stringify({ dave: {} }));
+  const once = run(t.b, ringAll, { env: { PATH: empty } });
+  assert.match(once.stderr, /ring failed for dave: tmux is not installed/);
+  assert.doesNotMatch(once.stderr, /for all/);
+});
+
+test('recovery hints quote the board dir for the shell', () => {
+  for (const sub of ['with space', "it's"]) {
+    const t = tmuxBoard(undefined, sub);
+    const real = fs.realpathSync(t.b.dir);
+    const quoted = `'${real.split("'").join("'\\''")}'`;
+    assert.equal(spawnSync('sh', ['-c', `printf '%s' ${quoted}`], { encoding: 'utf8' }).stdout, real);
+    const none = run(t.b, ringBob, { env: t.env([t.pane('%4', 'ann')]) });
+    assert.ok(none.stderr.includes(`in that agent's pane run: agent-board --dir ${quoted} tag --as bob;`), none.stderr);
+    const env = t.env([t.pane('%3', 'bob'), t.pane('%5', 'bob'), t.pane('%4', null)], { FAKE_UNSET_FAIL: '%5' });
+    const partial = run(t.b, ['tag', '--as', 'bob', '--pane', '%4', '--replace'], { env });
+    assert.ok(partial.stderr.includes(`fix: agent-board --dir ${quoted} tag --remove --pane %5`), partial.stderr);
+  }
 });
 
 test('tag --as tags the pane from TMUX_PANE or --pane, and says what it replaced', () => {
