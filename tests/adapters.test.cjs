@@ -182,7 +182,9 @@ test('extract returns only the final answer', () => {
   const claude = adapters.get('claude').invocation({ model: 'm', effort: 'low', cwd: dir, tmpDir: dir });
   assert.equal(claude.extract(JSON.stringify({ type: 'result', is_error: false, result: 'claude answer' })), 'claude answer');
   assert.equal(claude.extract(JSON.stringify([{ type: 'system' }, { type: 'result', result: 'from list' }])), 'from list');
-  assert.equal(claude.extract('plain text answer'), 'plain text answer');
+  assert.throws(() => claude.extract('Provider temporarily unavailable'), /not JSON/);
+  assert.throws(() => claude.extract(JSON.stringify({ type: 'result', is_error: false })), /no result text/);
+  assert.throws(() => claude.extract(JSON.stringify({ type: 'result', is_error: false, result: '' })), /no result text/);
   assert.throws(() => claude.extract(JSON.stringify({ type: 'result', is_error: true, result: 'rate limited' })), /rate limited/);
 
   const opencode = adapters.get('opencode').invocation({ model: 'a/b', effort: 'default', cwd: dir, tmpDir: dir });
@@ -269,6 +271,18 @@ test('setup --test is the one path that calls a model, and reports adapter, mode
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /test failed: test call exited 1.*provider unavailable/);
   assert.equal(fs.existsSync(path.join(failing.board, 'summarizer.json')), false, 'a failed test writes nothing');
+});
+
+test('setup --test refuses plain-text claude output and keeps an existing summarizer.json', () => {
+  const s = setup();
+  const file = path.join(s.board, 'summarizer.json');
+  const working = `${JSON.stringify({ adapter: 'claude', model: 'sonnet', effort: 'high' }, null, 2)}\n`;
+  fs.writeFileSync(file, working);
+  const bad = s.cli(['setup', '--adapter', 'claude', '--model', 'haiku', '--effort', 'low', '--test'],
+    { env: { STUB_TOOL_STDOUT: 'Provider temporarily unavailable' } });
+  assert.notEqual(bad.status, 0, bad.stdout);
+  assert.match(bad.stderr, /not JSON/);
+  assert.equal(fs.readFileSync(file, 'utf8'), working, 'summarizer.json is byte-for-byte unchanged');
 });
 
 test('thread close uses summarizer.json through the adapter and records adapter, model and effort', () => {

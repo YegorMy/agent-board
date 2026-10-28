@@ -3,7 +3,8 @@
 // Test stand-in for the codex / claude / opencode binaries: argv[2] names the tool. It answers --version and the
 // catalog commands in each tool's real format, and for a model call it logs argv, stdin and cwd (STUB_LOG) and
 // answers like a summarizer, wrapped in that tool's output format together with service noise.
-// STUB_TOOL_FAIL=<tool> makes that tool's model call exit 1.
+// STUB_TOOL_FAIL=<tool> makes that tool's model call exit 1. STUB_TOOL_STDOUT=<text> makes a model call print
+// exactly <text> and exit 0 instead of the usual output.
 
 const fs = require('node:fs');
 
@@ -55,6 +56,10 @@ function modelCall() {
     process.exit(1);
   }
   const answer = prompt.startsWith('Reply with') ? 'OK' : summary(prompt);
+  if (process.env.STUB_TOOL_STDOUT !== undefined) {
+    process.stdout.write(process.env.STUB_TOOL_STDOUT);
+    process.exit(0);
+  }
   if (tool === 'codex') {
     process.stdout.write('{"type":"service","note":"not the answer"}\n');
     fs.writeFileSync(argv[argv.indexOf('-o') + 1], answer);
