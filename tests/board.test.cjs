@@ -76,14 +76,51 @@ function sha(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
-// A stand-in tmux on PATH: list-panes prints FAKE_PANES, every other call is appended to TMUX_LOG.
+// A stateful stand-in tmux on PATH. FAKE_TMUX_STATE is a JSON list of panes { id, opts, where, command, dead };
+// list-panes fills the -F format from it, set-option [-u] changes it, and every other call is appended to TMUX_LOG.
+// Knobs: FAKE_LIST_DELAY (ms), FAKE_SET_FAIL / FAKE_UNSET_FAIL (a pane id whose set-option / set-option -u fails).
+const FAKE_TMUX = `#!/usr/bin/env node
+const fs = require('fs');
+const args = process.argv.slice(2);
+const file = process.env.FAKE_TMUX_STATE;
+const panes = JSON.parse(fs.readFileSync(file, 'utf8'));
+if (args[0] === 'list-panes') {
+  if (process.env.FAKE_LIST_DELAY) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.FAKE_LIST_DELAY));
+  const values = (pane) => {
+    const [session, rest] = pane.where.split(':');
+    const [window, index] = rest.split('.');
+    return { pane_id: pane.id, session_name: session, window_index: window, pane_index: index,
+      pane_current_command: pane.command, pane_dead: pane.dead ? '1' : '0' };
+  };
+  const format = args[args.indexOf('-F') + 1];
+  for (const pane of panes) {
+    process.stdout.write(format.replace(/#\\{([^}]+)\\}/g, (_, key) => (key[0] === '@' ? pane.opts[key] || '' : values(pane)[key])) + '\\n');
+  }
+  process.exit(0);
+}
+fs.appendFileSync(process.env.TMUX_LOG, args.join(' ') + '\\n');
+if (args[0] === 'set-option') {
+  const unset = args.includes('-u');
+  const target = args[args.indexOf('-t') + 1];
+  const [option, value] = args.filter((arg, i) => !arg.startsWith('-') && args[i - 1] !== '-t').slice(1);
+  if (process.env[unset ? 'FAKE_UNSET_FAIL' : 'FAKE_SET_FAIL'] === target) { process.stderr.write('fake tmux: refused\\n'); process.exit(1); }
+  const pane = panes.find((candidate) => candidate.id === target);
+  if (!pane) { process.stderr.write("can't find pane: " + target + '\\n'); process.exit(1); }
+  if (unset) delete pane.opts[option]; else pane.opts[option] = value;
+  fs.writeFileSync(file + '.tmp', JSON.stringify(panes));
+  fs.renameSync(file + '.tmp', file);
+}
+`;
+
 function fakeTmux(b) {
   const bin = path.join(b.dir, 'fake-bin');
-  fs.mkdirSync(bin);
-  fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\n'
-    + 'if [ "$1" = "list-panes" ]; then printf \'%s\\n\' "$FAKE_PANES"; exit 0; fi\n'
-    + 'printf \'%s\\n\' "$*" >> "$TMUX_LOG"\n', { mode: 0o755 });
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'tmux'), FAKE_TMUX, { mode: 0o755 });
   return bin;
+}
+
+function boardOption(dir) {
+  return `@agent_board_${crypto.createHash('sha256').update(fs.realpathSync(dir)).digest('hex').slice(0, 12)}`;
 }
 
 test('concurrent opens and posts get unique, contiguous ids', async () => {
@@ -338,35 +375,227 @@ test('ring uses the posted id; a failed doorbell is retried without reposting', 
   assert.match(fs.readFileSync(ringLog, 'utf8'), /agent-board: T0001.M003 for you \(back\)/);
 });
 
-test('tmux doorbell types into the one matching pane and degrades cleanly otherwise', () => {
+// A board with a fake tmux. pane() describes a pane tagged on this board, other() one tagged on another board;
+// env(panes) resets the fake server to those panes and returns the environment for run().
+function tmuxBoard(agents) {
   const b = board();
   const tmuxLog = path.join(b.dir, 'tmux.log');
-  const fakePath = `${fakeTmux(b)}${path.delimiter}${process.env.PATH}`;
-  fs.writeFileSync(path.join(b.dir, 'agents.json'), JSON.stringify({ bob: { tmux: 'bob' } }));
+  const stateFile = path.join(b.dir, 'tmux-state.json');
+  const option = boardOption(b.dir);
+  if (agents) fs.writeFileSync(path.join(b.dir, 'agents.json'), JSON.stringify(agents));
   open(b, 'ann', 'topic');
+  const make = (opts, id, where, command, dead) => ({ id, opts, where: where || 'main:1.0', command: command || 'claude', dead: Boolean(dead) });
+  const pane = (id, name, where, command, dead) => make(name ? { [option]: name } : {}, id, where, command, dead);
+  const other = (id, name) => make({ '@agent_board_000000000000': name }, id, 'x:0.0', 'zsh');
+  const env = (panes, extra = {}) => {
+    fs.writeFileSync(stateFile, JSON.stringify(panes));
+    return { PATH: `${fakeTmux(b)}${path.delimiter}${process.env.PATH}`, TMUX_LOG: tmuxLog, FAKE_TMUX_STATE: stateFile, TMUX_PANE: undefined, ...extra };
+  };
+  const logged = () => (fs.existsSync(tmuxLog) ? fs.readFileSync(tmuxLog, 'utf8') : '');
+  const tags = () => Object.fromEntries(JSON.parse(fs.readFileSync(stateFile, 'utf8')).map((p) => [p.id, p.opts[option]]));
+  return { b, option, pane, other, env, logged, tags, stateFile };
+}
 
-  const env = { PATH: fakePath, TMUX_LOG: tmuxLog, FAKE_PANES: '%3\tbob\n%4\tann\n%5\t' };
-  assert.match(ok(run(b, ['post', '--thread', 'T0001', '--from', 'ann', '--to', 'bob', '--subject', 'look', '--ring'], { env })), /rang bob for T0001.M002/);
-  assert.equal(fs.readFileSync(tmuxLog, 'utf8'), 'send-keys -t %3 -l agent-board: T0001.M002 for you (look)\nsend-keys -t %3 Enter\n');
+const ringBob = ['post', '--thread', 'T0001', '--from', 'ann', '--to', 'bob', '--subject', 'look', '--ring'];
+const ringAll = ['post', '--thread', 'T0001', '--from', 'ann', '--to', 'all', '--subject', 'hello', '--ring'];
 
-  const none = run(b, ['post', '--thread', 'T0001', '--from', 'ann', '--to', 'bob', '--subject', 'again', '--ring'], { env: { ...env, FAKE_PANES: '%4\tann' } });
-  assert.equal(none.status, 3);
-  assert.match(none.stdout, /posted T0001.M003/);
-  assert.match(none.stderr, /ring failed for bob: expected exactly one tmux pane with @agent_display_name=bob, found 0; retry with: ring --id T0001.M003/);
-
-  const absent = run(b, ['post', '--thread', 'T0001', '--from', 'ann', '--to', 'bob', '--subject', 'no tmux', '--ring'], { env: { PATH: path.join(b.dir, 'empty') } });
-  assert.equal(absent.status, 3);
-  assert.match(absent.stdout, /posted T0001.M004/);
-  assert.match(absent.stderr, /ring failed for bob: tmux is not installed or not on PATH/);
-  assert.equal(messages(b, 'T0001').length, 4);
+test('the pane option is derived from the real board path', () => {
+  const one = board();
+  const two = board();
+  assert.match(boardOption(one.dir), /^@agent_board_[0-9a-f]{12}$/);
+  assert.notEqual(boardOption(one.dir), boardOption(two.dir));
+  const link = path.join(two.dir, 'link');
+  fs.symlinkSync(one.dir, link);
+  assert.equal(boardOption(link), boardOption(one.dir));
 });
 
-test('tmux doorbell resolves exactly the pane with the matching agent display name', () => {
-  const { panesNamed } = require('../lib/ring-tmux.cjs');
-  const listing = '%0\tbuilder\n%2\t\n%5\tother\nbogus\tbuilder\n';
-  assert.deepEqual(panesNamed(listing, 'builder'), ['%0']);
-  assert.deepEqual(panesNamed(listing, 'missing'), []);
-  assert.deepEqual(panesNamed('%0\tx\n%1\tx\n', 'x'), ['%0', '%1']);
+test('a symlinked --dir shares the tag with the real board directory', () => {
+  const t = tmuxBoard();
+  const link = path.join(board().dir, 'link');
+  fs.symlinkSync(t.b.dir, link);
+  const env = t.env([t.pane('%3', null)]);
+  assert.match(ok(run(t.b, ['--dir', link, 'tag', '--as', 'bob', '--pane', '%3'], { env })), new RegExp(`tagged %3 as bob on this board \\(${t.option}\\)`));
+  assert.equal(t.tags()['%3'], 'bob');
+  assert.equal(ok(run(t.b, ['tag', '--list'], { env })), 'bob\t%3 (main:1.0 claude)\n');
+});
+
+test('ring types into the one pane tagged on this board', () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', 'bob'), t.pane('%4', 'ann'), t.pane('%5', null)]);
+  assert.match(ok(run(t.b, ringBob, { env })), /rang bob for T0001.M002/);
+  assert.equal(t.logged(), 'send-keys -t %3 -l agent-board: T0001.M002 for you (look)\nsend-keys -t %3 Enter\n');
+});
+
+test('two boards with the same agent names ring their own panes', () => {
+  const one = tmuxBoard();
+  const two = tmuxBoard();
+  const panes = [
+    { ...one.pane('%3', 'claude'), opts: { [one.option]: 'claude', [two.option]: 'sol' } },
+    { ...one.pane('%4', null), opts: { [two.option]: 'claude', [one.option]: 'sol' } },
+  ];
+  const env = one.env(panes, { TMUX_LOG: path.join(one.b.dir, 'shared.log') });
+  const toClaude = ['post', '--thread', 'T0001', '--from', 'ann', '--to', 'claude', '--subject', 'hi', '--ring'];
+  ok(run(one.b, toClaude, { env }));
+  ok(run(two.b, toClaude, { env }));
+  assert.equal(fs.readFileSync(env.TMUX_LOG, 'utf8').split('\n').filter((l) => l.includes('Enter')).join('|'), 'send-keys -t %3 Enter|send-keys -t %4 Enter');
+});
+
+test('ring reports zero or several tagged panes and a missing tmux, and ignores other boards', () => {
+  const t = tmuxBoard();
+  const dir = fs.realpathSync(t.b.dir);
+  const none = run(t.b, ringBob, { env: t.env([t.pane('%4', 'ann'), t.other('%6', 'bob')]) });
+  assert.equal(none.status, 3);
+  assert.match(none.stdout, /posted T0001.M002/);
+  assert.ok(none.stderr.includes(`ring failed for bob: no tmux pane is tagged bob on this board; in that agent's pane run: agent-board --dir ${dir} tag --as bob; retry with: ring --id T0001.M002`), none.stderr);
+
+  const two = run(t.b, ringBob, { env: t.env([t.pane('%3', 'bob'), t.pane('%7', 'bob', 'dev:0.1', 'node')]) });
+  assert.equal(two.status, 3);
+  assert.ok(two.stderr.includes(`ring failed for bob: 2 tmux panes are tagged bob on this board: %3 (main:1.0 claude), %7 (dev:0.1 node); in the right pane run: agent-board --dir ${dir} tag --as bob --replace; retry with:`), two.stderr);
+  assert.equal(t.logged(), '');
+
+  const absent = run(t.b, ringBob, { env: { PATH: path.join(t.b.dir, 'empty') } });
+  assert.equal(absent.status, 3);
+  assert.match(absent.stderr, /ring failed for bob: tmux is not installed or not on PATH/);
+  assert.equal(messages(t.b, 'T0001').length, 4);
+});
+
+test('dead panes are never rung, never part of --to all, and never conflict in tag', () => {
+  const t = tmuxBoard();
+  const dead = t.pane('%3', 'bob', 'main:1.0', 'claude', true);
+  assert.match(run(t.b, ringBob, { env: t.env([dead]) }).stderr, /no tmux pane is tagged bob on this board/);
+  assert.match(ok(run(t.b, ringBob, { env: t.env([dead, t.pane('%5', 'bob')]) })), /rang bob/);
+  assert.equal(t.logged(), 'send-keys -t %5 -l agent-board: T0001.M003 for you (look)\nsend-keys -t %5 Enter\n');
+  const all = ok(run(t.b, ringAll, { env: t.env([t.pane('%6', 'dave', 'main:2.0', 'claude', true)]) }));
+  assert.doesNotMatch(all, /rang/);
+  const env = t.env([dead, t.pane('%4', null)]);
+  assert.match(ok(run(t.b, ['tag', '--as', 'bob', '--pane', '%4'], { env })), /^tagged %4 as bob/);
+  assert.match(run(t.b, ['tag', '--as', 'bob', '--pane', '%3'], { env }).stderr, /no live tmux pane %3/);
+  assert.match(run(t.b, ['tag', '--remove', '--pane', '%3'], { env }).stderr, /no live tmux pane %3/);
+  assert.equal(ok(run(t.b, ['tag', '--list'], { env })), 'bob\t%4 (main:1.0 claude)\n');
+});
+
+test('ring --to all reaches tagged agents missing from agents.json and skips silent ones', () => {
+  const t = tmuxBoard({ carol: { doorbell: null }, dave: {}, erin: { doorbell: ['false'] } });
+  const env = t.env([t.pane('%3', 'bob'), t.pane('%4', 'ann'), t.pane('%5', 'carol')]);
+  const all = run(t.b, ringAll, { env });
+  assert.equal(all.status, 3);
+  assert.match(all.stdout, /rang bob for T0001.M002/);
+  assert.doesNotMatch(all.stdout, /rang (ann|carol|dave)/);
+  assert.doesNotMatch(all.stderr, /carol|dave|ann/);
+  assert.match(all.stderr, /ring failed for erin: exit 1/);
+  assert.equal(t.logged(), 'send-keys -t %3 -l agent-board: T0001.M002 for you (hello)\nsend-keys -t %3 Enter\n');
+});
+
+test('doorbell: null is never rung, even with a live tagged pane', () => {
+  const t = tmuxBoard({ bob: { doorbell: null } });
+  const result = run(t.b, ringBob, { env: t.env([t.pane('%3', 'bob')]) });
+  assert.equal(result.status, 3);
+  assert.match(result.stderr, /ring failed for bob: agents\.json sets doorbell: null/);
+  assert.equal(t.logged(), '');
+});
+
+test('a command doorbell works without tmux, and --to all reports no tmux failure when none is needed', () => {
+  const ringLog = path.join(board().dir, 'ring.log');
+  const writer = [process.execPath, '-e', "require('fs').appendFileSync(process.env.RING_LOG, process.argv[1] + '\\n')", '{message}'];
+  const t = tmuxBoard({ bob: { doorbell: writer }, carol: { doorbell: null } });
+  const env = { PATH: path.join(t.b.dir, 'empty'), RING_LOG: ringLog };
+  const one = run(t.b, ringBob, { env });
+  assert.equal(one.status, 0, one.stderr);
+  assert.match(one.stdout, /rang bob for T0001.M002/);
+  const all = run(t.b, ringAll, { env });
+  assert.equal(all.status, 0, all.stderr);
+  assert.equal(all.stderr, '');
+  assert.match(all.stdout, /rang bob for T0001.M003/);
+  assert.equal(fs.readFileSync(ringLog, 'utf8').split('\n').filter(Boolean).length, 2);
+});
+
+test('tag --as tags the pane from TMUX_PANE or --pane, and says what it replaced', () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', null), t.pane('%4', 'ann')]);
+  const viaEnv = ok(run(t.b, ['tag', '--as', 'bob'], { env: { ...env, TMUX_PANE: '%3' } }));
+  assert.equal(viaEnv, `tagged %3 as bob on this board (${t.option})\n`);
+  assert.equal(t.logged(), `set-option -p -t %3 ${t.option} bob\n`);
+  const viaFlag = ok(run(t.b, ['tag', '--as', 'bob', '--pane', '%4', '--replace'], { env }));
+  assert.equal(viaFlag, `tagged %4 as bob on this board (${t.option}) (was ann)\nuntagged %3\n`);
+  assert.deepEqual(t.tags(), { '%3': undefined, '%4': 'bob' });
+});
+
+test('re-tagging the pane that already holds the name succeeds without --replace', () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', 'bob')]);
+  assert.equal(ok(run(t.b, ['tag', '--as', 'bob', '--pane', '%3'], { env })), `tagged %3 as bob on this board (${t.option})\n`);
+  assert.deepEqual(t.tags(), { '%3': 'bob' });
+  assert.equal(t.logged(), `set-option -p -t %3 ${t.option} bob\n`);
+});
+
+test('tag --as refuses a name held by another pane unless --replace', () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', 'bob'), t.pane('%4', null)]);
+  const refused = run(t.b, ['tag', '--as', 'bob', '--pane', '%4'], { env });
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /bob is already tagged on this board in: %3 \(main:1\.0 claude\); add --replace/);
+  assert.equal(t.logged(), '');
+  const replaced = ok(run(t.b, ['tag', '--as', 'bob', '--pane', '%4', '--replace'], { env }));
+  assert.equal(replaced, `tagged %4 as bob on this board (${t.option})\nuntagged %3\n`);
+  assert.equal(t.logged(), `set-option -p -t %4 ${t.option} bob\nset-option -p -u -t %3 ${t.option}\n`);
+});
+
+test('--replace sets the new tag first: a failed set keeps the old holder', () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', 'bob'), t.pane('%4', null)], { FAKE_SET_FAIL: '%4' });
+  const result = run(t.b, ['tag', '--as', 'bob', '--pane', '%4', '--replace'], { env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /tmux set-option failed: fake tmux: refused/);
+  assert.deepEqual(t.tags(), { '%3': 'bob', '%4': undefined });
+  assert.doesNotMatch(t.logged(), / -u /);
+});
+
+test('--replace reports panes it could not untag after a successful set', () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', 'bob'), t.pane('%5', 'bob'), t.pane('%4', null)], { FAKE_UNSET_FAIL: '%5' });
+  const result = run(t.b, ['tag', '--as', 'bob', '--pane', '%4', '--replace'], { env });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /tagged %4 as bob/);
+  assert.match(result.stdout, /untagged %3/);
+  assert.ok(result.stderr.includes(`could not untag %5: tmux set-option failed: fake tmux: refused; fix: agent-board --dir ${fs.realpathSync(t.b.dir)} tag --remove --pane %5`), result.stderr);
+  assert.deepEqual(t.tags(), { '%3': undefined, '%5': 'bob', '%4': 'bob' });
+});
+
+test('concurrent tag --as for one name on different panes: one wins, one is refused', async () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', null), t.pane('%4', null)], { FAKE_LIST_DELAY: '400' });
+  const results = await Promise.all(['%3', '%4'].map((pane) => runAsync(t.b, ['tag', '--as', 'bob', '--pane', pane], { env })));
+  assert.deepEqual(results.map((r) => r.status).sort(), [0, 1], results.map((r) => r.stderr).join('\n'));
+  assert.match(results.find((r) => r.status === 1).stderr, /already tagged/);
+  assert.equal(Object.values(t.tags()).filter((name) => name === 'bob').length, 1);
+});
+
+test('tag --list and --remove', () => {
+  const t = tmuxBoard();
+  const panes = [t.pane('%5', 'bob', 'dev:0.1', 'node'), t.pane('%3', 'ann'), t.pane('%4', null), t.other('%6', 'zed')];
+  assert.equal(ok(run(t.b, ['tag', '--list'], { env: t.env(panes) })), 'ann\t%3 (main:1.0 claude)\nbob\t%5 (dev:0.1 node)\n');
+  assert.equal(ok(run(t.b, ['tag', '--list'], { env: t.env([t.pane('%4', null)]) })), 'no tmux panes are tagged on this board\n');
+  const env = t.env(panes);
+  ok(run(t.b, ['tag', '--remove', '--pane', '%5'], { env }));
+  assert.equal(t.logged(), `set-option -p -u -t %5 ${t.option}\n`);
+  assert.deepEqual(t.tags(), { '%5': undefined, '%3': 'ann', '%4': undefined, '%6': undefined });
+  assert.match(ok(run(t.b, ['tag', '--remove', '--pane', '%4'], { env })), /%4 has no tag on this board/);
+  assert.equal(t.logged().split('\n').filter(Boolean).length, 1);
+});
+
+test('tag validates its input', () => {
+  const t = tmuxBoard();
+  const env = t.env([t.pane('%3', null)]);
+  assert.match(run(t.b, ['tag', '--as', 'bob'], { env }).stderr, /not inside tmux.*--pane %N/);
+  assert.match(run(t.b, ['tag', '--as', 'bob', '--pane', 'main'], { env }).stderr, /--pane must look like %3/);
+  assert.match(run(t.b, ['tag', '--as', 'bob', '--pane', '%9'], { env }).stderr, /no live tmux pane %9/);
+  assert.equal(run(t.b, ['tag', '--as', 'a/b', '--pane', '%3'], { env }).status, 1);
+  assert.match(run(t.b, ['tag', '--as', 'bob', '--list'], { env }).stderr, /exactly one of/);
+  assert.match(run(t.b, ['tag'], { env }).stderr, /exactly one of/);
+  const missing = run(t.b, ['tag', '--list'], { env: { ...env, CHANNEL_DIR: path.join(t.b.dir, 'nowhere') } });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /no board at .*nowhere/);
+  assert.equal(t.logged(), '');
 });
 
 test('watch prints one line per new message for the agent', async () => {

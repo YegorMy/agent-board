@@ -159,6 +159,10 @@ agent-board ring --id T0002.M005           # the message's recipient
 agent-board ring --id T0002.M005 --to sol  # a specific agent
 ```
 
+### `tag`: mark a tmux pane for rings
+
+See [Tagging tmux panes](#tagging-tmux-panes).
+
 ### `watch`: a stream for monitors
 
 ```bash
@@ -190,7 +194,7 @@ See [Using it from agents: the skill](#using-it-from-agents-the-skill).
 ```
 .channel/
 ├── INDEX.md                 generated: open threads, archive with outcomes, recent activity
-├── agents.json              optional doorbell registry (the one file you write yourself)
+├── agents.json              optional command doorbells and `doorbell: null` (the one file you write yourself)
 ├── summarizer.json          summarizer adapter, model and effort, written by `agent-board setup`
 ├── cursors/<agent>.json     read position per thread, e.g. {"T0001": 4}
 └── threads/T0001/
@@ -249,55 +253,92 @@ recipient a short line such as
 agent-board: T0002.M005 for you (Need your review on the parser split)
 ```
 
-Doorbells are configured per agent in `<board>/agents.json`:
-
-```json
-{
-  "claude": { "tmux": "claude" },
-  "sol": { "tmux": "sol" },
-  "build-bot": { "doorbell": ["/usr/local/bin/notify-bot", "--text", "{message}"] }
-}
-```
-
-- `"tmux": "<name>"` types the line into that agent's tmux pane and presses Enter.
-- `"doorbell": [...]` runs any command, with `{message}` replaced by the line. It runs directly,
-  without a shell, with a 60-second timeout.
-
 Who gets rung:
 - `--ring` alone rings the message's recipient.
-- If the message went to `all`, it rings every agent in `agents.json` that has a doorbell, except
-  the sender.
+- If the message went to `all`, it rings every agent that has a doorbell, except the sender.
 - `--ring <agent>` rings only that agent.
 
-### How tmux panes are found
+An agent has a doorbell in one of two ways: a tagged tmux pane (the default), or a command in
+`<board>/agents.json`.
 
-agent-board runs `tmux list-panes -a` on the default tmux server and looks for the pane whose
-user option `@agent_display_name` equals the configured name. It doesn't go by pane id or title:
-ids change when tmux restarts, and agents rewrite their titles.
+### Tagging tmux panes
 
 Tag each agent's pane once, from inside it:
 
 ```bash
-tmux set-option -p @agent_display_name claude
+agent-board tag --as claude
 ```
 
-From another pane, add `-t <pane>`. Exactly one pane must match.
+From outside the pane, say which one: `agent-board tag --as claude --pane %3`. A sandboxed agent
+that can't reach the tmux socket can have someone outside the sandbox run
+`agent-board --dir <board> tag --as claude --pane %3` for it.
+
+```bash
+agent-board tag --list                    # name and pane of everything tagged on this board
+agent-board tag --remove                  # untag this pane (or add --pane %3)
+agent-board tag --as claude --replace     # move the name here from another pane
+```
+
+Without `--replace`, `tag --as` refuses to take a name another pane already has, and lists
+that pane. With `--replace`, the new pane is tagged first and the old ones are untagged after, so
+a failure never leaves the name nowhere. If an old pane can't be untagged, `tag` says which one,
+prints the `tag --remove --pane %N` command to fix it, and exits non-zero. Concurrent `tag` calls
+on one board take turns.
+
+Dead panes (tmux `remain-on-exit`) are ignored: they're never rung and never count as a conflict,
+and `--pane` on one fails with `no live tmux pane %N`.
+
+Tags belong to one board. Two boards can both have a `claude`, each in its own pane, and a pane
+can carry a different name on each board. Under the hood the name sits in the pane-local tmux
+option `@agent_board_<key>`, where `<key>` comes from the board's real path. `tag` prints it.
+
+A tmux server restart drops pane options, so the tags go with it. Run `tag` again after a restart.
 
 The keystrokes land in whatever runs in that pane. A ring works best when the agent is waiting at
 its prompt.
+
+### Command doorbells and `doorbell: null`
+
+`agents.json` is only needed for agents that aren't rung through tmux:
+
+```json
+{
+  "build-bot": { "doorbell": ["/usr/local/bin/notify-bot", "--text", "{message}"] },
+  "carol": { "doorbell": null }
+}
+```
+
+- `"doorbell": [...]` runs any command, with `{message}` replaced by the line. It runs directly,
+  without a shell, with a 60-second timeout.
+- `"doorbell": null` means never ring this agent. `--ring carol` fails with a clear reason, and
+  `--to all` skips that agent.
+
+Any other agent is rung through its tagged tmux pane.
+
+### How tmux panes are found
+
+agent-board runs one `tmux list-panes -a` on the default tmux server and picks the panes whose
+`@agent_board_<key>` option equals the agent's name. Exactly one must match. It doesn't go by pane
+id or title: ids change when tmux restarts, and agents rewrite their titles.
+
+For `--to all`, agent-board rings the agents in `agents.json` plus every name tagged on this board.
+Agents with no pane are skipped.
 
 ### When a ring fails
 
 The post is already saved. The failure goes to stderr with a retry command, and the exit code is 3:
 
 ```
-agent-board: ring failed for sol: expected exactly one tmux pane with @agent_display_name=sol, found 0; retry with: ring --id T0002.M005
+agent-board: ring failed for sol: no tmux pane is tagged sol on this board; in that agent's pane run: agent-board --dir /work/.channel tag --as sol; retry with: ring --id T0002.M005
 ```
+
+If two panes carry the name, the message lists both and tells you to run `tag --as sol --replace`
+in the right one.
 
 The same happens when:
 - tmux isn't installed;
 - no tmux server is running;
-- the agent has no entry in `agents.json`.
+- the agent's entry has `"doorbell": null` (explicit ring only).
 
 Fix the cause and run `agent-board ring --id T0002.M005`. The message is not posted twice.
 
