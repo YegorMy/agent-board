@@ -50,7 +50,7 @@ test('fresh install writes both roots with a manifest', () => {
   }
   assert.match(r.text, /installed: .*\.claude.*read by claude/);
   assert.match(r.text, /installed: .*\.agents.*read by codex, opencode; shared root/);
-  assert.match(r.text, /note: opencode reads both/);
+  assert.match(r.text, /note: opencode reads both.*two discovery roots/);
 });
 
 test('codex and opencode targets write one shared copy', () => {
@@ -64,6 +64,51 @@ test('codex and opencode targets write one shared copy', () => {
   install(s, { target: 'claude' });
   assert.ok(fs.existsSync(claudeDest(s)));
   assert.ok(!fs.existsSync(path.join(s.home, '.agents')));
+});
+
+// Fails only the tmp -> dest publish rename (and, when asked, the restore old -> dest) of an update.
+function withFailingPublish(s, { failRestore }, fn) {
+  const real = fs.renameSync;
+  const dest = claudeDest(s);
+  fs.renameSync = (from, to) => {
+    const isTmp = path.basename(from).endsWith('.tmp');
+    if (to === dest && (isTmp || (failRestore && from.endsWith('.tmp.old')))) {
+      throw Object.assign(new Error(`ENOSPC: no space left on device, rename '${from}' -> '${to}'`), { code: 'ENOSPC' });
+    }
+    return real(from, to);
+  };
+  try { return fn(); } finally { fs.renameSync = real; }
+}
+
+test('a failed publish on update restores the previous version and leaves no temp or backup', () => {
+  const s = sandbox();
+  install(s, { target: 'claude' });
+  fs.writeFileSync(path.join(s.source, 'SKILL.md'), 'two\n');
+  let text = '';
+  assert.throws(() => withFailingPublish(s, { failRestore: false }, () => {
+    installSkill({ target: 'claude' }, { home: s.home, source: s.source, out: (t) => { text += t; } });
+  }), /ENOSPC/);
+  assert.equal(fs.readFileSync(path.join(claudeDest(s), 'SKILL.md'), 'utf8'), ONE);
+  assert.ok(fs.existsSync(path.join(claudeDest(s), MANIFEST)));
+  assert.deepEqual(fs.readdirSync(path.dirname(claudeDest(s))), ['agent-board']);
+  assert.equal(install(s, { target: 'claude' }).refused, false);
+  assert.equal(fs.readFileSync(path.join(claudeDest(s), 'SKILL.md'), 'utf8'), 'two\n');
+});
+
+test('a failed publish whose restore also fails keeps the backup and names its path', () => {
+  const s = sandbox();
+  install(s, { target: 'claude' });
+  fs.writeFileSync(path.join(s.source, 'SKILL.md'), 'two\n');
+  let message = '';
+  try {
+    withFailingPublish(s, { failRestore: true }, () => install(s, { target: 'claude' }));
+  } catch (error) { message = error.message; }
+  const names = fs.readdirSync(path.dirname(claudeDest(s)));
+  const backup = names.find((name) => name.endsWith('.tmp.old'));
+  assert.ok(backup, `backup kept: ${names}`);
+  assert.ok(!names.some((name) => name.endsWith('.tmp')));
+  assert.ok(message.includes(path.join(path.dirname(claudeDest(s)), backup)), message);
+  assert.equal(fs.readFileSync(path.join(path.dirname(claudeDest(s)), backup, 'SKILL.md'), 'utf8'), ONE);
 });
 
 test('unknown target is an error', () => {
@@ -214,7 +259,15 @@ test('CLI exits non-zero on refusal, zero otherwise, and honors HOME', () => {
 });
 
 test('npm pack lists the skill', () => {
-  const r = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: path.resolve(__dirname, '..'), encoding: 'utf8' });
+  const cache = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-board-npm-cache-'));
+  let r;
+  try {
+    r = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts', '--cache', cache], {
+      cwd: path.resolve(__dirname, '..'), encoding: 'utf8', env: { ...process.env, npm_config_cache: cache },
+    });
+  } finally {
+    fs.rmSync(cache, { recursive: true, force: true });
+  }
   assert.equal(r.status, 0, r.stderr);
   const names = JSON.parse(r.stdout)[0].files.map((f) => f.path);
   assert.ok(names.includes('skills/agent-board/SKILL.md'));

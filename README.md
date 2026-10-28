@@ -405,8 +405,9 @@ Use them if you want to vary the model.
 | `all` (default) | both roots above | all three |
 
 Codex and OpenCode share `~/.agents/skills`, so they get one copy, never two in the same root. OpenCode
-also reads `~/.claude/skills`, so with `all` it sees the skill in both roots; the command prints a note
-about it. Use `--target codex` or `--target claude` for a single copy. The home directory comes from
+also reads `~/.claude/skills`, so with `all` it can find the skill in two discovery roots; the command
+prints a note about it. For a single copy in OpenCode, set `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1` or
+install with `--target codex` only. The home directory comes from
 `$HOME`.
 
 Each root gets a `.agent-board-skill.json` manifest (tool, version, sha256 of every file). It proves the
